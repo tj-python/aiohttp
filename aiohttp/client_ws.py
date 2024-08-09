@@ -82,6 +82,7 @@ class ClientWebSocketResponse:
         self._exception: Optional[BaseException] = None
         self._compress = compress
         self._client_notakeover = client_notakeover
+        self._ping_task: Optional[asyncio.Task[None]] = None
 
         self._reset_heartbeat()
 
@@ -90,6 +91,9 @@ class ClientWebSocketResponse:
         if self._heartbeat_cb is not None:
             self._heartbeat_cb.cancel()
             self._heartbeat_cb = None
+        if self._ping_task is not None:
+            self._ping_task.cancel()
+            self._ping_task = None
 
     def _cancel_pong_response_cb(self) -> None:
         if self._pong_response_cb is not None:
@@ -128,11 +132,6 @@ class ClientWebSocketResponse:
             )
             return
 
-        # fire-and-forget a task is not perfect but maybe ok for
-        # sending ping. Otherwise we need a long-living heartbeat
-        # task in the class.
-        loop.create_task(self._writer.ping())  # type: ignore[unused-awaitable]
-
         conn = self._conn
         timeout_ceil_threshold = (
             conn._connector._timeout_ceil_threshold if conn is not None else 5
@@ -140,6 +139,22 @@ class ClientWebSocketResponse:
         when = calculate_timeout_when(now, self._pong_heartbeat, timeout_ceil_threshold)
         self._cancel_pong_response_cb()
         self._pong_response_cb = loop.call_at(when, self._pong_not_received)
+
+        if sys.version_info >= (3, 12):
+            # Optimization for Python 3.12, try to send the ping
+            # immediately to avoid having to schedule
+            # the task on the event loop.
+            ping_task = asyncio.Task(self._writer.ping(), loop=loop, eager_start=True)
+        else:
+            ping_task = loop.create_task(self._writer.ping())
+
+        if not ping_task.done():
+            self._ping_task = ping_task
+            ping_task.add_done_callback(self._ping_task_done)
+
+    def _ping_task_done(self, task: "asyncio.Task[None]") -> None:
+        """Callback for when the ping task completes."""
+        self._ping_task = None
 
     def _pong_not_received(self) -> None:
         if not self._closed:
@@ -276,6 +291,8 @@ class ClientWebSocketResponse:
             return False
 
     async def receive(self, timeout: Optional[float] = None) -> WSMessage:
+        receive_timeout = timeout or self._timeout.ws_receive
+
         while True:
             if self._waiting:
                 raise RuntimeError("Concurrent call to receive() is not allowed")
@@ -289,9 +306,14 @@ class ClientWebSocketResponse:
             try:
                 self._waiting = True
                 try:
-                    async with async_timeout.timeout(
-                        timeout or self._timeout.ws_receive
-                    ):
+                    if receive_timeout:
+                        # Entering the context manager and creating
+                        # Timeout() object can take almost 50% of the
+                        # run time in this loop so we avoid it if
+                        # there is no read timeout.
+                        async with async_timeout.timeout(receive_timeout):
+                            msg = await self._reader.read()
+                    else:
                         msg = await self._reader.read()
                     self._reset_heartbeat()
                 finally:

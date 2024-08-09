@@ -174,7 +174,10 @@ class FileResponse(StreamResponse):
 
             compressed_path = file_path.with_suffix(file_path.suffix + file_extension)
             with suppress(OSError):
-                return compressed_path, compressed_path.stat(), file_encoding
+                # Do not follow symlinks and ignore any non-regular files.
+                st = compressed_path.lstat()
+                if S_ISREG(st.st_mode):
+                    return compressed_path, st, file_encoding
 
         # Fallback to the uncompressed file
         return file_path, file_path.stat(), None
@@ -188,7 +191,9 @@ class FileResponse(StreamResponse):
             file_path, st, file_encoding = await loop.run_in_executor(
                 None, self._get_file_path_stat_encoding, accept_encoding
             )
-        except FileNotFoundError:
+        except OSError:
+            # Most likely to be FileNotFoundError or OSError for circular
+            # symlinks in python >= 3.13, so respond with 404.
             self.set_status(HTTPNotFound.status_code)
             return await super().prepare(request)
 
